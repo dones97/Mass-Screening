@@ -34,7 +34,8 @@ print(f"Original working directory: {ORIGINAL_CWD}")
 # Find factoranalysis and Valuation directories
 local_paths = [
     (Path("factoranalysis"), Path("Valuation")),  # GitHub Actions checkout paths
-    (Path("..") / "factoranalysis", Path("..") / "Valuation")  # Sibling directories locally
+    (Path("..") / "factoranalysis", Path("..") / "Valuation"),  # Sibling directories locally (from parent)
+    (Path("..") / ".." / "factoranalysis", Path("..") / ".." / "Valuation")  # Sibling directories locally (from subfolder)
 ]
 
 FACTOR_DIR = None
@@ -48,10 +49,15 @@ for f_path, v_path in local_paths:
         break
 
 if not FACTOR_DIR:
-    # Default fallbacks
-    FACTOR_DIR = (ORIGINAL_CWD / ".." / "factoranalysis").resolve()
-    VALUATION_DIR = (ORIGINAL_CWD / ".." / "Valuation").resolve()
+    # Default fallbacks (check if running inside subfolder)
+    if (ORIGINAL_CWD / ".." / ".." / "factoranalysis").exists():
+        FACTOR_DIR = (ORIGINAL_CWD / ".." / ".." / "factoranalysis").resolve()
+        VALUATION_DIR = (ORIGINAL_CWD / ".." / ".." / "Valuation").resolve()
+    else:
+        FACTOR_DIR = (ORIGINAL_CWD / ".." / "factoranalysis").resolve()
+        VALUATION_DIR = (ORIGINAL_CWD / ".." / "Valuation").resolve()
     print(f"Project directories not automatically detected. Using fallbacks:\n  FactorAnalysis: {FACTOR_DIR}\n  Valuation: {VALUATION_DIR}")
+
 
 # Define data paths
 nse_map_path = FACTOR_DIR / "data" / "nse_map.csv"
@@ -115,18 +121,18 @@ class DummyStreamlit:
 sys.modules['streamlit'] = DummyStreamlit()
 
 # 3. Load Universe & Deduplicate by ISIN
+# 3. Load Universe & Filter by Database Availability
 print("\nLoading NSE and BSE maps...")
-stocks = {}
-
+nse_tickers = {}
 if nse_map_path.exists():
     try:
         df_nse = pd.read_csv(nse_map_path)
         for _, row in df_nse.iterrows():
-            isin = str(row.get('ISIN', '')).strip()
             ticker = str(row.get('Ticker', '')).strip().upper()
+            isin = str(row.get('ISIN', '')).strip()
             name = str(row.get('NAME OF COMPANY', '')).strip()
-            if isin and ticker and isin != 'nan' and ticker != 'nan':
-                stocks[isin] = {
+            if ticker and isin and ticker != 'nan' and isin != 'nan':
+                nse_tickers[ticker] = {
                     'isin': isin,
                     'ticker': ticker + '.NS',
                     'symbol': ticker,
@@ -136,41 +142,73 @@ if nse_map_path.exists():
         print(f"Loaded {len(df_nse)} tickers from NSE map.")
     except Exception as e:
         print(f"Error loading NSE map: {e}")
-else:
-    print(f"Warning: NSE map not found at {nse_map_path}")
 
+bse_tickers = {}
 if bse_map_path.exists():
     try:
         df_bse = pd.read_csv(bse_map_path)
-        bse_count = 0
-        bse_added = 0
         for _, row in df_bse.iterrows():
-            isin = str(row.get('ISIN', '')).strip()
             ticker_sym = str(row.get('TckrSymb', '')).strip().upper()
+            isin = str(row.get('ISIN', '')).strip()
             name = str(row.get('FinInstrmNm', '')).strip()
-            if isin and ticker_sym and isin != 'nan' and ticker_sym != 'nan':
-                bse_count += 1
-                if isin not in stocks:
-                    stocks[isin] = {
-                        'isin': isin,
-                        'ticker': ticker_sym + '.BO',
-                        'symbol': ticker_sym,
-                        'name': name,
-                        'exchange': 'BSE'
-                    }
-                    bse_added += 1
-        print(f"Loaded {bse_count} tickers from BSE map; added {bse_added} BSE-only tickers.")
+            if ticker_sym and isin and ticker_sym != 'nan' and isin != 'nan':
+                bse_tickers[ticker_sym] = {
+                    'isin': isin,
+                    'ticker': ticker_sym + '.BO',
+                    'symbol': ticker_sym,
+                    'name': name,
+                    'exchange': 'BSE'
+                }
+        print(f"Loaded {len(df_bse)} tickers from BSE map.")
     except Exception as e:
         print(f"Error loading BSE map: {e}")
+
+# Load tickers from database
+print("Loading tickers from database to filter universe...")
+db_tickers = []
+if db_source_path.exists():
+    try:
+        db_conn = sqlite3.connect(db_source_path)
+        db_rows = db_conn.execute("SELECT ticker FROM companies WHERE data_available=1").fetchall()
+        db_tickers = [r[0].strip().upper() for r in db_rows]
+        db_conn.close()
+        print(f"Found {len(db_tickers)} companies with available data in the database.")
+    except Exception as e:
+        print(f"Error reading database tickers: {e}")
 else:
-    print(f"Warning: BSE map not found at {bse_map_path}")
+    print(f"Warning: Database source {db_source_path} not found. Cannot filter universe by DB availability.")
+
+stocks = {}
+if db_tickers:
+    for db_t in db_tickers:
+        if db_t in nse_tickers:
+            info = nse_tickers[db_t]
+            stocks[info['isin']] = info
+        elif db_t in bse_tickers:
+            info = bse_tickers[db_t]
+            stocks[info['isin']] = info
+        else:
+            # Fallback if in database but not in maps (default to NSE)
+            stocks[db_t] = {
+                'isin': db_t,
+                'ticker': db_t + '.NS',
+                'symbol': db_t,
+                'name': db_t,
+                'exchange': 'NSE'
+            }
+else:
+    # Fallback to loading all tickers if database loading failed
+    print("Fallback: Using all tickers from NSE map.")
+    for isin, info in nse_tickers.items():
+        stocks[isin] = info
 
 total_unique_stocks = len(stocks)
-print(f"Total unique stocks across NSE & BSE: {total_unique_stocks}")
+print(f"Total unique stocks to screen: {total_unique_stocks}")
 
 if total_unique_stocks == 0:
     print("Error: No tickers loaded. Exiting.")
     sys.exit(1)
+
 
 # 4. Batch Download Price Data
 print("\nPreparing price data download (10 years of weekly data)...")
@@ -181,8 +219,8 @@ all_prices = {}
 weekly_returns_dict = {}
 tickers_list = [s['ticker'] for s in stocks.values()]
 
-# Split into batches of 150 to respect yfinance rate limits
-batch_size = 150
+# Split into batches of 250 to respect yfinance rate limits and minimize requests
+batch_size = 250
 total_batches = (len(tickers_list) - 1) // batch_size + 1
 
 print(f"Downloading price data in {total_batches} batches...")
@@ -191,40 +229,54 @@ for idx in range(0, len(tickers_list), batch_size):
     batch_num = idx // batch_size + 1
     print(f"Processing batch {batch_num}/{total_batches} ({len(batch)} tickers)...")
     
-    try:
-        # Download daily prices
-        df = yf.download(batch, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval="1d", progress=False, group_by='ticker')
-        
-        # Parse close prices for each ticker in the batch
-        for ticker in batch:
-            try:
-                # Handle single vs multi-index columns from yfinance
-                if isinstance(df.columns, pd.MultiIndex):
-                    if ticker in df.columns.levels[0]:
-                        ticker_df = df[ticker]
-                    else:
-                        continue
+    df = pd.DataFrame()
+    retries = 3
+    for attempt in range(retries):
+        try:
+            df = yf.download(batch, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval="1d", progress=False, group_by='ticker')
+            if not df.empty:
+                break
+            else:
+                print(f"  Attempt {attempt+1} returned empty data. Retrying in 12s...")
+                time.sleep(12)
+        except Exception as e:
+            print(f"  Attempt {attempt+1} failed with error: {e}. Retrying in 12s...")
+            time.sleep(12)
+            
+    if df.empty:
+        print(f"  Warning: Batch {batch_num} failed completely after {retries} attempts.")
+        continue
+
+    # Parse close prices for each ticker in the batch
+    for ticker in batch:
+        try:
+            # Handle single vs multi-index columns from yfinance
+            if isinstance(df.columns, pd.MultiIndex):
+                if ticker in df.columns.levels[0]:
+                    ticker_df = df[ticker]
                 else:
-                    ticker_df = df
-                
-                # Check if 'Close' exists
-                close_col = [c for c in ticker_df.columns if c.lower().startswith('close')]
-                if close_col:
-                    close = ticker_df[close_col[0]].dropna()
-                    if len(close) > 10:
-                        # Resample to weekly (Friday)
-                        weekly_prices = close.resample('W-FRI').last()
-                        all_prices[ticker] = weekly_prices
-                        # Calculate weekly percent change
-                        returns = weekly_prices.pct_change().dropna()
-                        if len(returns) > 5:
-                            weekly_returns_dict[ticker] = returns
-            except Exception as e:
-                # Silently skip single ticker failures to avoid cluttering logs
-                pass
-    except Exception as e:
-        print(f"Error downloading batch {batch_num}: {e}")
-    time.sleep(0.5)
+                    continue
+            else:
+                ticker_df = df
+            
+            # Check if 'Close' exists
+            close_col = [c for c in ticker_df.columns if c.lower().startswith('close')]
+            if close_col:
+                close = ticker_df[close_col[0]].dropna()
+                if len(close) > 10:
+                    # Resample to weekly (Friday)
+                    weekly_prices = close.resample('W-FRI').last()
+                    all_prices[ticker] = weekly_prices
+                    # Calculate weekly percent change
+                    returns = weekly_prices.pct_change().dropna()
+                    if len(returns) > 5:
+                        weekly_returns_dict[ticker] = returns
+        except Exception as e:
+            # Silently skip single ticker failures to avoid cluttering logs
+            pass
+
+    time.sleep(3.0) # sleep between batches to respect rate limits
+
 
 print(f"Successfully downloaded price history for {len(weekly_returns_dict)} stocks.")
 
