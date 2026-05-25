@@ -27,7 +27,39 @@ from pathlib import Path
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
+# Rate limit resilient yfinance Ticker wrapper
+class RateLimitResilientTicker(yf.Ticker):
+    @property
+    def info(self):
+        retries = 3
+        for attempt in range(retries):
+            try:
+                # Disable print redirection temporarily if any
+                data = super().info
+                if data:
+                    return data
+            except Exception as e:
+                pass
+            time.sleep(8)
+        return {}
+
+    def history(self, *args, **kwargs):
+        retries = 3
+        for attempt in range(retries):
+            try:
+                df = super().history(*args, **kwargs)
+                if not df.empty:
+                    return df
+            except Exception as e:
+                pass
+            time.sleep(8)
+        return pd.DataFrame()
+
+# Apply monkey patch
+yf.Ticker = RateLimitResilientTicker
+
 # 1. Environment Setup & Sibling Directory Detection
+
 ORIGINAL_CWD = Path.cwd().resolve()
 print(f"Original working directory: {ORIGINAL_CWD}")
 
@@ -202,6 +234,11 @@ else:
     for isin, info in nse_tickers.items():
         stocks[isin] = info
 
+if os.environ.get("TEST_RUN") == "1":
+    limit = int(os.environ.get("TEST_LIMIT", "10"))
+    print(f"TEST_RUN mode enabled: Limiting universe to {limit} stocks.")
+    stocks = dict(list(stocks.items())[:limit])
+
 total_unique_stocks = len(stocks)
 print(f"Total unique stocks to screen: {total_unique_stocks}")
 
@@ -219,8 +256,8 @@ all_prices = {}
 weekly_returns_dict = {}
 tickers_list = [s['ticker'] for s in stocks.values()]
 
-# Split into batches of 250 to respect yfinance rate limits and minimize requests
-batch_size = 250
+# Split into batches of 60 to respect yfinance rate limits and minimize requests
+batch_size = 60
 total_batches = (len(tickers_list) - 1) // batch_size + 1
 
 print(f"Downloading price data in {total_batches} batches...")
@@ -234,10 +271,21 @@ for idx in range(0, len(tickers_list), batch_size):
     for attempt in range(retries):
         try:
             df = yf.download(batch, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval="1d", progress=False, group_by='ticker')
+            
+            # Check how many tickers returned successfully
+            successful_tickers = []
             if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    successful_tickers = list(df.columns.levels[0])
+                else:
+                    # Handle single ticker DataFrame or Series
+                    successful_tickers = [df.name] if hasattr(df, 'name') else list(df.columns) if hasattr(df, 'columns') else []
+            
+            # If 90% or more succeeded, we are good
+            if len(successful_tickers) >= 0.9 * len(batch):
                 break
             else:
-                print(f"  Attempt {attempt+1} returned empty data. Retrying in 12s...")
+                print(f"  Attempt {attempt+1}: Only {len(successful_tickers)}/{len(batch)} tickers succeeded. Rate limited? Retrying in 12s...")
                 time.sleep(12)
         except Exception as e:
             print(f"  Attempt {attempt+1} failed with error: {e}. Retrying in 12s...")
@@ -246,6 +294,7 @@ for idx in range(0, len(tickers_list), batch_size):
     if df.empty:
         print(f"  Warning: Batch {batch_num} failed completely after {retries} attempts.")
         continue
+
 
     # Parse close prices for each ticker in the batch
     for ticker in batch:
@@ -373,6 +422,10 @@ try:
         ticker = stock['ticker']
         clean_ticker = stock['symbol']
         
+        # Proactive sleep to avoid hitting yfinance rate limits
+        if idx > 0:
+            time.sleep(2.0)
+            
         try:
             # Predict P/E and Fair Price
             pred = val_model.predict_pe(ticker)
