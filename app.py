@@ -180,6 +180,14 @@ stocks_df['clean_ticker'] = stocks_df['symbol']
 if 'expected_return' in stocks_df.columns:
     stocks_df['expected_return'] = stocks_df['expected_return'] * 100
 
+# Initialize excluded tickers in session state
+if "excluded_tickers" not in st.session_state:
+    st.session_state["excluded_tickers"] = []
+
+# Exclude stocks selected by the user
+if st.session_state["excluded_tickers"]:
+    stocks_df = stocks_df[~stocks_df['symbol'].isin(st.session_state["excluded_tickers"])].copy()
+
 # 2. Key Metrics Cards Row
 col1, col2, col3 = st.columns(3)
 
@@ -219,6 +227,12 @@ col_f1, col_f2 = st.columns([1, 3])
 with col_f1:
     sectors = ["All"] + sorted(list(stocks_df['sector'].dropna().unique()))
     selected_sector = st.selectbox("Filter by Sector", sectors)
+with col_f2:
+    if st.session_state["excluded_tickers"]:
+        st.markdown("<div style='padding-top: 25px;'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Restore Deleted Stocks"):
+            st.session_state["excluded_tickers"] = []
+            st.rerun()
 
 # Filter dataset
 filtered_df = stocks_df.copy()
@@ -236,11 +250,17 @@ display_cols = [
 ]
 
 display_df = filtered_df[display_cols].copy()
+display_df.insert(0, 'Delete', False)
 
 # Render interactive table with premium column styling
-st.dataframe(
+edited_df = st.data_editor(
     display_df,
     column_config={
+        "Delete": st.column_config.CheckboxColumn(
+            "Delete",
+            help="Check to delete/exclude this stock from table & graphs",
+            default=False
+        ),
         "clean_ticker": st.column_config.TextColumn(
             "Ticker",
             help="Stock ticker symbol (excluding suffix)"
@@ -294,9 +314,19 @@ st.dataframe(
             help="3-year historical stock price performance"
         )
     },
+    disabled=display_cols,
     use_container_width=True,
-    hide_index=True
+    hide_index=True,
+    key="screener_table_editor"
 )
+
+# Detect deleted/excluded tickers
+if edited_df is not None and not edited_df.empty:
+    deleted_rows = edited_df[edited_df['Delete'] == True]
+    if not deleted_rows.empty:
+        newly_deleted = deleted_rows['clean_ticker'].tolist()
+        st.session_state["excluded_tickers"].extend(newly_deleted)
+        st.rerun()
 
 st.markdown("<div style='margin-bottom: 30px;'></div>", unsafe_allow_html=True)
 
@@ -311,7 +341,7 @@ with tab1:
             filtered_df,
             x="expected_sharpe",
             y="valuation_upside_pct",
-            size="market_cap_cr",
+            size="expected_return",
             color="sector",
             hover_name="name",
             hover_data={
@@ -326,9 +356,10 @@ with tab1:
             labels={
                 "expected_sharpe": "Expected Sharpe Ratio (Factor Model)",
                 "valuation_upside_pct": "Valuation Upside (%) (RF Model)",
+                "expected_return": "Expected Return (%)",
                 "sector": "Sector"
             },
-            title="Factor Sharpe Ratio vs. Valuation Upside (Size = Market Cap)"
+            title="Factor Sharpe Ratio vs. Valuation Upside (Size = Expected Return)"
         )
         
         # Style Plotly Dark Theme
