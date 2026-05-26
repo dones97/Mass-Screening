@@ -176,6 +176,10 @@ last_updated = data_dict.get("last_updated", "N/A")
 # Pre-format ticker column for links/display
 stocks_df['clean_ticker'] = stocks_df['symbol']
 
+# Convert expected return from fraction to percentage
+if 'expected_return' in stocks_df.columns:
+    stocks_df['expected_return'] = stocks_df['expected_return'] * 100
+
 # 2. Key Metrics Cards Row
 col1, col2, col3 = st.columns(3)
 
